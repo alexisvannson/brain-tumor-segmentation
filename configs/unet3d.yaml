@@ -1,0 +1,23 @@
+model:
+  down_layers:
+    - [4, 32]
+    - [32, 64]
+    - [64, 128]
+    - [128, 256]
+    - [256, 320]
+  up_layers:
+    - [320, 256]
+    - [256, 128]
+    - [128, 64]
+    - [64, 32]
+  final_block: [32, 3]
+
+training:
+  data_dir: brats2020/BraTS2020_training_data/content/data
+  checkpoint_dir: checkpoints
+  epochs: 50
+  batch_size: 1
+  lr: 1.0e-4
+  val_split: 0.2
+  num_workers: 2
+  patience: 10
