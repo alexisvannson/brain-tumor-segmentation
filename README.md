@@ -12,7 +12,8 @@ Segmentation of brain tumors from multimodal MRI using U-Net architectures train
 │   ├── brats_dataset.py    # 2D slice loader (H5)
 │   └── brats_dataset3d.py  # 3D volume loader (H5)
 ├── scripts/
-│   └── training.py      # Training loop, validation, checkpointing
+│   ├── training.py      # Training loop, validation, checkpointing
+│   └── evaluate.py      # Evaluation: Dice and IoU per class
 ├── configs/
 │   ├── unet.yaml         # 2D U-Net config
 │   └── unet3d.yaml       # 3D U-Net config
@@ -61,6 +62,21 @@ python scripts/training.py unet --config configs/unet.yaml
 
 Checkpoints are saved to `checkpoint_dir` (set in config). `best.pth` is updated whenever validation loss improves.
 
+## Evaluation
+
+```bash
+# Evaluate 2D U-Net on full dataset
+python scripts/evaluate.py unet checkpoints/best.pth
+
+# Evaluate 3D U-Net with a custom data directory
+python scripts/evaluate.py unet3d checkpoints/best.pth --data_dir /path/to/data
+
+# Save results to a file
+python scripts/evaluate.py unet checkpoints/best.pth --output results/eval.txt
+```
+
+Reports per-class and mean Dice and IoU for the three BraTS regions (whole tumor, tumor core, enhancing tumor).
+
 ## Tests
 
 ```bash
@@ -72,8 +88,9 @@ pytest tests/ -v
 ## References
 
 **Dataset**
-- B. H. Menze et al., "The Multimodal Brain Tumor Image Segmentation Benchmark (BRATS)," *IEEE Transactions on Medical Imaging*, vol. 34, no. 10, pp. 1993–2024, 2015. https://doi.org/10.1109/TMI.2014.2377694
-- S. Bakas et al., "Advancing The Cancer Genome Atlas glioma MRI collections with expert segmentation labels and radiomic features," *Scientific Data*, vol. 4, 170117, 2017. https://doi.org/10.1038/sdata.2017.117
+BraTS 2020 Training Data  
+Kaggle Dataset: [https://www.kaggle.com/datasets/awsaf49/brats2020-training-data](https://www.kaggle.com/datasets/awsaf49/brats2020-training-data)  
+
 
 **U-Net**
 - O. Ronneberger, P. Fischer, T. Brox, "U-Net: Convolutional Networks for Biomedical Image Segmentation," *MICCAI 2015*, LNCS vol. 9351, pp. 234–241. https://doi.org/10.1007/978-3-319-24574-4_28
