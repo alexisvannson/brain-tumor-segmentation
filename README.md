@@ -18,8 +18,6 @@ Segmentation of brain tumors from multimodal MRI using U-Net architectures train
 │   ├── unet.yaml         # 2D U-Net config
 │   └── unet3d.yaml       # 3D U-Net config
 ├── tests/               # Pytest test suite (121 tests)
-└── notebooks/
-    └── train_colab.ipynb # Google Colab training notebook
 ```
 
 ## Models
