@@ -1,36 +1,32 @@
 import torch
 import torch.nn as nn
-import torchvision.transforms.functional as torchvision
+import torchvision.transforms.functional as TF
+
+
+def _parse(layer):
+    return layer if isinstance(layer, tuple) else (layer, layer)
+
 
 class DownBlock(nn.Module):
-    def __init__(self, input_channels: int, out_value=None):
-        super(DownBlock, self).__init__()
-        self.input_channels = input_channels
-        self.output_channels = out_value if out_value else 2 * self.input_channels
-        self.conv1 = nn.Conv2d(self.input_channels, self.output_channels, kernel_size=3) #padding=1
-        self.conv2 = nn.Conv2d(self.output_channels, self.output_channels, kernel_size=3) # padding=1
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3)
         self.relu = nn.ReLU(inplace=True)
-    
+
     def forward(self, x):
-        shape = x.shape
-        print(shape)
         x = self.relu(self.conv1(x))
-        shape = x.shape
-        print(shape)
         x = self.relu(self.conv2(x))
-        shape = x.shape
-        print(shape)
         return x
 
+
 class UpBlock(nn.Module):
-    def __init__(self, input_channels: int, out_value=None):
-        super(UpBlock, self).__init__()
-        self.input_channels = input_channels
-        self.output_channels = out_value if out_value else int(self.input_channels) // 2
-        self.conv1 = nn.Conv2d(self.input_channels, self.output_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(self.output_channels, self.output_channels, kernel_size=3, padding=1)
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
         self.relu = nn.ReLU(inplace=True)
-    
+
     def forward(self, x):
         x = self.relu(self.conv1(x))
         x = self.relu(self.conv2(x))
@@ -38,13 +34,11 @@ class UpBlock(nn.Module):
 
 
 class FinalBlock(nn.Module):
-    def __init__(self, input_channels, output_channels):
-        super(FinalBlock, self).__init__()
-        self.input_channels = input_channels
-        self.output_channels = output_channels
-        self.conv1 = nn.Conv2d(self.input_channels, self.output_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(self.output_channels, self.output_channels, kernel_size=3, padding=1)
-        self.final = nn.Conv2d(self.output_channels, self.output_channels, kernel_size=1)
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1)
+        self.final = nn.Conv2d(in_ch, out_ch, kernel_size=1)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -53,65 +47,70 @@ class FinalBlock(nn.Module):
         x = self.final(x)
         return x
 
-def _parse(layer):
-      return layer if isinstance(layer, tuple) else (layer, layer)
 
 class Unet(nn.Module):
-    def __init__(self, layers, bottleneck_block, final_block):
-        super(Unet, self).__init__()
+    def __init__(self, down_layers, up_layers, final_block):
+        super().__init__()
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        down_layers, up_layers = layers
-        down_blocks = []
-        for layer in down_layers:
-            in_ch, out_ch = _parse(layer)
-            down_blocks.append(DownBlock(in_ch, out_ch))
-            if layer != down_layers[-1]:
-                down_blocks.append(self.pool)
-        self.downwards = nn.ModuleList(down_blocks)
 
-        up_blocks = []
-        for layer in up_layers[:-1]:
+        # Encoder — last block is the bottleneck (no pool after it)
+        self.down_blocks = nn.ModuleList([
+            DownBlock(*_parse(layer)) for layer in down_layers
+        ])
+
+        # Decoder — upsample then merge skip connection
+        self.up_transposes = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
+        for layer in up_layers:
             in_ch, out_ch = _parse(layer)
-            up_blocks.append(UpBlock(in_ch, out_ch))
-            up_blocks.append(nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2))
-        last = up_layers[-1]
-        up_blocks.append(UpBlock(last))
-        up_blocks.append(nn.Conv2d(last, last, kernel_size=1))
-        self.upwards = nn.ModuleList(up_blocks)
+            self.up_transposes.append(nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2))
+            # After center-crop and concat with skip, input channels to UpBlock double
+            self.up_blocks.append(UpBlock(2 * out_ch, out_ch))
+
         final_in, final_out = final_block
         self.final = FinalBlock(final_in, final_out)
-   
+
+    def _crop_skip(self, skip, target):
+        """Center-crop skip connection to match target spatial dimensions."""
+        _, _, h, w = target.shape
+        _, _, sh, sw = skip.shape
+        top  = (sh - h) // 2
+        left = (sw - w) // 2
+        return TF.crop(skip, top=top, left=left, height=h, width=w)
+
     def forward(self, x):
-        output_values = []
-        output_shapes = []
-        for layer in self.downwards:
-            x = layer(x)
-            output_values += [x]
-            output_shapes += [x.shape]
+        # Encoder: save skip connections before pooling
+        skips = []
+        for down_block in self.down_blocks[:-1]:
+            x = down_block(x)
+            skips.append(x)
+            x = self.pool(x)
 
-        for idx, layer in enumerate(self.upwards):
-            
-            down_image = output_values[-( idx + 1)]
-            _, _ , down_width, down_height = down_image.shape
-            _, _, current_width, current_height = x.shape
-            delta1 , delta2 = (down_height - current_height) // 2 , (down_width - current_width) // 2
+        # Bottleneck
+        x = self.down_blocks[-1](x)
 
-            residual = torchvision.crop(img=down_image, top=delta1, left=delta2, height=current_height, width=current_width)
-            print("residual shape: ", residual.shape)
-            print("current tensor shape: ", x.shape)
-            x = torch.concat((x, residual), dim=1)
-            x = layer(x)
-            print(x.shape)
-       
-        return  x
+        # Decoder
+        for up_t, up_b, skip in zip(self.up_transposes, self.up_blocks, reversed(skips)):
+            x = up_t(x)
+            skip = self._crop_skip(skip, x)
+            x = torch.cat((x, skip), dim=1)
+            x = up_b(x)
+
+        return self.final(x)
+
 
 if __name__ == "__main__":
-    layers = ([(1, 64), 64, 128, 256], [1024, 512, 256, 128])
-    dense_block = 512
-    final_block = (64, 2)
-    model = Unet(layers, dense_block, final_block)
+    import yaml
+
+    with open("configs/unet.yaml") as f:
+        cfg = yaml.safe_load(f)["model"]
+
+    down_layers = [tuple(l) for l in cfg["down_layers"]]
+    up_layers   = [tuple(l) for l in cfg["up_layers"]]
+    final_block = tuple(cfg["final_block"])
+
+    model = Unet(down_layers, up_layers, final_block)
 
     tensor = torch.rand(1, 1, 572, 572)
-
     pred = model(tensor)
     print(pred.shape)
