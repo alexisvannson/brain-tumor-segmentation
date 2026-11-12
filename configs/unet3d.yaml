@@ -28,5 +28,6 @@ training:
   epochs: 50
   batch_size: 1
   lr: 1.0e-4
+  amp: true            # mixed precision on CUDA (bf16 on A100, fp16 + loss scaling on older GPUs)
   num_workers: 2
   patience: 10

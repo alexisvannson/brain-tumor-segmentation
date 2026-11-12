@@ -581,3 +581,63 @@ class TestPatientLevelDataloaders:
         assert val_loader.batch_size == 1
         img, mask = val_loader.dataset[0]
         assert img.shape == (4, 3, 16, 16)  # whole patient volume
+
+
+# ---------------------------------------------------------------------------
+# mixed precision
+# ---------------------------------------------------------------------------
+
+from unittest import mock
+
+from scripts.training import amp_settings
+
+
+class TestMixedPrecision:
+    def test_disabled_on_cpu(self):
+        assert amp_settings(torch.device("cpu"), True) == (False, torch.float32, False)
+
+    def test_disabled_when_off(self):
+        assert amp_settings(torch.device("cuda"), False) == (False, torch.float32, False)
+
+    def test_bf16_without_scaler_when_supported(self):
+        with mock.patch("torch.cuda.is_bf16_supported", return_value=True):
+            assert amp_settings(torch.device("cuda"), True) == (True, torch.bfloat16, False)
+
+    def test_fp16_with_scaler_otherwise(self):
+        with mock.patch("torch.cuda.is_bf16_supported", return_value=False):
+            assert amp_settings(torch.device("cuda"), True) == (True, torch.float16, True)
+
+    def test_train_with_amp_flag_on_cpu(self, tmp_path):
+        """amp=True must fall back cleanly on CPU and still update the model."""
+        model = _tiny_model_2d()
+        before = [p.clone() for p in model.parameters()]
+        train(
+            model=model, train_loader=_make_loader_2d(), criterion=nn.BCEWithLogitsLoss(),
+            optimizer=optim.Adam(model.parameters(), lr=1e-3), device=torch.device("cpu"),
+            epochs=1, val_loader=_make_loader_2d(n=4), output_path=str(tmp_path),
+            weights_name="amp", use_wandb=False, amp=True,
+        )
+        assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
+
+    def test_validate_with_amp_flag_on_cpu(self):
+        model, loader = _tiny_model_2d(), _make_loader_2d()
+        a = validate(model, loader, nn.BCEWithLogitsLoss(), torch.device("cpu"), amp=True)
+        b = validate(model, loader, nn.BCEWithLogitsLoss(), torch.device("cpu"), amp=False)
+        assert a["loss"] == pytest.approx(b["loss"])
+
+
+class TestLoaderSettings:
+    def test_workers_persistent(self, tmp_path):
+        import h5py
+        import numpy as np
+        for p in range(5):
+            with h5py.File(tmp_path / f"volume_{p}_slice_0.h5", "w") as f:
+                f.create_dataset("image", data=np.random.rand(16, 16, 4).astype(np.float32))
+                f.create_dataset("mask", data=np.zeros((16, 16, 3), dtype=np.float32))
+        cfg = {"data": {"data_dir": str(tmp_path), "split_file": str(tmp_path / "s.json"),
+                        "val_split": 0.2, "test_split": 0.2},
+               "training": {"batch_size": 2, "num_workers": 2}}
+        train_loader, val_loader = setup_dataloaders(cfg, "unet")
+        assert train_loader.num_workers == 2 and train_loader.persistent_workers
+        assert train_loader.prefetch_factor == 4
+        assert val_loader.persistent_workers

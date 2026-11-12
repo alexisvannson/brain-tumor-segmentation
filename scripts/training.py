@@ -122,7 +122,28 @@ def predict(model, images, slice_batch=16):
     return out.reshape(b, d, *out.shape[1:]).permute(0, 2, 1, 3, 4)
 
 
-def validate(model, val_loader, criterion, device, threshold=0.5, slice_batch=16):
+def amp_settings(device, enabled=True):
+    """Mixed-precision settings for `device`.
+
+    Returns (use_autocast, dtype, use_grad_scaler). bfloat16 is used where the
+    GPU supports it (Ampere and newer, e.g. A100) and needs no loss scaling;
+    older GPUs (e.g. T4) fall back to float16 with a GradScaler. On CPU,
+    mixed precision is off.
+    """
+    if not enabled or device.type != "cuda":
+        return False, torch.float32, False
+    if torch.cuda.is_bf16_supported():
+        return True, torch.bfloat16, False
+    return True, torch.float16, True
+
+
+def _grad_scaler(enabled):
+    if hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def validate(model, val_loader, criterion, device, threshold=0.5, slice_batch=16, amp=False):
     """
     Validate the model on the validation set.
 
@@ -131,6 +152,9 @@ def validate(model, val_loader, criterion, device, threshold=0.5, slice_batch=16
     loss is computed the way the model is trained (per slice for a 2D model),
     so train and val losses can be compared directly.
 
+    With `amp`, the forward pass runs in mixed precision; losses and metrics
+    are always computed in float32.
+
     Returns:
         dict with "loss" (float), "dice" (per-class tensor, mean over cases)
         and "mean_dice" (float, mean over classes).
@@ -138,11 +162,14 @@ def validate(model, val_loader, criterion, device, threshold=0.5, slice_batch=16
     model.eval()
     total_loss = 0.0
     case_dice = []
+    use_autocast, amp_dtype, _ = amp_settings(device, amp)
 
     with torch.no_grad():
         for images, masks in val_loader:
-            images, masks = images.to(device), masks.to(device)
-            preds = predict(model, images, slice_batch)
+            images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
+                preds = predict(model, images, slice_batch)
+            preds = preds.float()
             masks = _crop_masks(masks, preds)
             if _runs_slicewise(model, images):
                 total_loss += seg_loss(_volume_to_slices(preds), _volume_to_slices(masks), criterion).item()
@@ -169,8 +196,12 @@ def train(
     weights_name="final_model",
     start_weights=None,
     use_wandb=False,
+    amp=False,
 ):
     """Train with checkpoint selection and early stopping on validation mean Dice.
+
+    `amp=True` enables mixed precision on CUDA (bfloat16 where supported,
+    otherwise float16 with loss scaling). The loss is always computed in float32.
 
     Without a val_loader the training loss is used instead (lower is better).
     The scheduler, if given, is stepped with the same score, so a
@@ -196,6 +227,11 @@ def train(
         f.write(f"Device: {device}\n")
         f.write("-" * 50 + "\n")
 
+    use_autocast, amp_dtype, use_scaler = amp_settings(device, amp)
+    scaler = _grad_scaler(use_scaler)
+    if use_autocast:
+        print(f"Mixed precision: {amp_dtype}" + (" with gradient scaling" if use_scaler else ""))
+
     history_path = os.path.join(output_path, "history.csv")
     history_fields = ["epoch", "train_loss", "val_loss"] + [f"val_dice_{r}" for r in REGIONS] + \
                      ["val_mean_dice", "lr", "epoch_seconds"]
@@ -210,15 +246,18 @@ def train(
         model.train()
 
         for images, masks in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False):
-            images, masks = images.to(device), masks.to(device)
-            optimizer.zero_grad()
-            preds = model(images)
+            images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_autocast):
+                preds = model(images)
+            preds = preds.float()  # loss in float32: soft-Dice sums are imprecise in half precision
             masks = _crop_masks(masks, preds)
             bce  = criterion(preds, masks)
             dice = dice_loss(preds, masks)
             loss = bce + dice  # same as seg_loss(preds, masks, criterion)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             epoch_loss += loss.item()
 
         avg_train_loss = epoch_loss / len(train_loader)
@@ -228,7 +267,7 @@ def train(
         row = {"epoch": epoch, "train_loss": avg_train_loss, "lr": lr, "epoch_seconds": epoch_time}
 
         if val_loader is not None:
-            val = validate(model, val_loader, criterion, device)
+            val = validate(model, val_loader, criterion, device, amp=amp)
             score = val["mean_dice"]
             desc = f"val_mean_dice={score:.4f}"
             if scheduler is not None:
@@ -339,9 +378,16 @@ def setup_dataloaders(config, model_name="unet"):
     num_workers = training_cfg.get("num_workers", 0)
     seed        = training_cfg.get("seed", 42)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                              generator=torch.Generator().manual_seed(seed))
-    val_loader   = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=num_workers)
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,  # don't re-spawn workers every epoch
+    )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                              generator=torch.Generator().manual_seed(seed), **loader_kwargs)
+    val_loader   = DataLoader(val_set, batch_size=1, shuffle=False, **loader_kwargs)
     print(f"Train: {len(split['train'])} patients ({len(train_set)} items) | "
           f"Val: {len(split['val'])} patients | Test (held out): {len(split['test'])} patients")
     return train_loader, val_loader
@@ -403,6 +449,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # fixed input sizes: let cuDNN pick the fastest kernels
 
     model = create_model(args.model, config).to(device)
 
@@ -439,6 +487,7 @@ def main():
         patience=train_config.get("patience", 10),
         start_weights=args.weights,
         use_wandb=use_wandb,
+        amp=train_config.get("amp", True),
     )
 
     if use_wandb:

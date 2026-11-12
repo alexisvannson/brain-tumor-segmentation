@@ -86,6 +86,10 @@ and early stopping and the LR scheduler track the same score. Each run also writ
 Both models use padded convolutions by default (`model.padding: 1`), so predictions cover the
 full image. `padding: 0` restores the original valid-convolution U-Net, whose output is only a centre crop.
 
+On a GPU, training uses mixed precision (`training.amp: true`): bfloat16 on Ampere or newer (e.g. A100), and
+float16 with loss scaling on older GPUs (e.g. T4). The loss is always computed in float32. Set `amp: false`
+for full float32.
+
 ## Evaluation
 
 ```bash
