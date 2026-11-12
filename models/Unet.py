@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
 
@@ -8,10 +9,10 @@ def _parse(layer):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, padding: int = 1):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=padding)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=padding)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -49,13 +50,23 @@ class FinalBlock(nn.Module):
 
 
 class Unet(nn.Module):
-    def __init__(self, down_layers, up_layers, final_block):
+    """2D U-Net.
+
+    With ``padding=1`` (default) the encoder keeps spatial size, inputs are
+    zero-padded to a multiple of 2**n_pools and the output is cropped back, so
+    the prediction covers the full input. ``padding=0`` reproduces the original
+    valid-convolution U-Net, whose output is a centre crop of the input.
+    """
+    spatial_dims = 2
+
+    def __init__(self, down_layers, up_layers, final_block, padding: int = 1):
         super().__init__()
+        self.padding = padding
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # Encoder — last block is the bottleneck (no pool after it)
         self.down_blocks = nn.ModuleList([
-            DownBlock(*_parse(layer)) for layer in down_layers
+            DownBlock(*_parse(layer), padding=padding) for layer in down_layers
         ])
 
         # Decoder — upsample then merge skip connection
@@ -79,6 +90,12 @@ class Unet(nn.Module):
         return TF.crop(skip, top=top, left=left, height=h, width=w)
 
     def forward(self, x):
+        size = x.shape[2:]
+        if self.padding:
+            m = 2 ** (len(self.down_blocks) - 1)
+            ph, pw = (-size[0]) % m, (-size[1]) % m
+            x = F.pad(x, (0, pw, 0, ph))
+
         # Encoder: save skip connections before pooling
         skips = []
         for down_block in self.down_blocks[:-1]:
@@ -96,7 +113,10 @@ class Unet(nn.Module):
             x = torch.cat((x, skip), dim=1)
             x = up_b(x)
 
-        return self.final(x)
+        x = self.final(x)
+        if self.padding:
+            x = x[:, :, :size[0], :size[1]]
+        return x
 
 
 if __name__ == "__main__":
@@ -111,6 +131,6 @@ if __name__ == "__main__":
 
     model = Unet(down_layers, up_layers, final_block)
 
-    tensor = torch.rand(1, 1, 572, 572)
+    tensor = torch.rand(1, 4, 240, 240)
     pred = model(tensor)
     print(pred.shape)

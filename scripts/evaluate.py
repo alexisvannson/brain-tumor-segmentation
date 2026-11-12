@@ -1,4 +1,12 @@
+"""Per-patient evaluation on a patient-level split (the held-out test set by default).
+
+For every patient the full volume is predicted (slice by slice for the 2D
+model) and Dice, IoU and HD95 are computed for the three BraTS regions. The
+per-patient table is saved as CSV; the summary reports mean ± std and median
+across patients.
+"""
 import argparse
+import csv
 import os
 import sys
 
@@ -9,86 +17,75 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from models.Unet import Unet
-from models.Unet3d import Unet3d
-from datasets.brats_dataset import BraTSDataset
-from datasets.brats_dataset3d import BraTSDataset3D
-from scripts.training import create_model, load_config, _crop_masks
+from datasets.transforms import REGIONS
+from scripts.metrics import binarize, case_metrics, summarize
+from scripts.training import _crop_masks, create_model, get_split, load_config, predict, volume_dataset
+
+CLASSES = REGIONS
+METRICS = ["dice", "iou", "hd95"]
 
 
-CLASSES = ["whole_tumor", "tumor_core", "enhancing_tumor"]
-
-
-def dice_score(pred, target, eps=1e-6):
-    """Compute per-class Dice score. pred: (B, C, ...) logits, target: (B, C, ...) binary."""
-    pred = (torch.sigmoid(pred) > 0.5).float()
-    spatial_dims = tuple(range(2, pred.dim()))
-    intersection = (pred * target).sum(dim=spatial_dims)
-    union = pred.sum(dim=spatial_dims) + target.sum(dim=spatial_dims)
-    return ((2 * intersection + eps) / (union + eps)).mean(dim=0)  # (C,)
-
-
-def iou_score(pred, target, eps=1e-6):
-    """Compute per-class IoU. pred: (B, C, ...) logits, target: (B, C, ...) binary."""
-    pred = (torch.sigmoid(pred) > 0.5).float()
-    spatial_dims = tuple(range(2, pred.dim()))
-    intersection = (pred * target).sum(dim=spatial_dims)
-    union = pred.sum(dim=spatial_dims) + target.sum(dim=spatial_dims) - intersection
-    return ((intersection + eps) / (union + eps)).mean(dim=0)  # (C,)
-
-
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, threshold=0.5, with_hd95=True, slice_batch=16, case_ids=None):
+    """Return a list of per-case rows: {"case", "<metric>_<region>": value, ...}."""
     model.eval()
-    dice_sum = torch.zeros(3)
-    iou_sum = torch.zeros(3)
-    n_batches = 0
-
+    rows = []
     with torch.no_grad():
-        for images, masks in tqdm(loader, desc="Evaluating"):
+        for i, (images, masks) in enumerate(tqdm(loader, desc="Evaluating")):
             images, masks = images.to(device), masks.to(device)
-            preds = model(images)
+            preds = predict(model, images, slice_batch)
             masks = _crop_masks(masks, preds)
-            dice_sum += dice_score(preds, masks).cpu()
-            iou_sum += iou_score(preds, masks).cpu()
-            n_batches += 1
+            m = case_metrics(binarize(preds, threshold), masks > 0.5, with_hd95=with_hd95)
+            for b in range(images.shape[0]):
+                idx = i * loader.batch_size + b
+                row = {"case": case_ids[idx] if case_ids else idx}
+                for name, values in m.items():
+                    for c, region in enumerate(CLASSES):
+                        row[f"{name}_{region}"] = values[b, c].item()
+                rows.append(row)
+    return rows
 
-    mean_dice = dice_sum / n_batches
-    mean_iou  = iou_sum  / n_batches
-    return mean_dice, mean_iou
 
-
-def print_results(mean_dice, mean_iou, output_file=None):
+def summary_table(rows):
     lines = [
         "",
-        "=" * 52,
-        f"{'Class':<20} {'Dice':>10} {'IoU':>10}",
-        "-" * 52,
+        "=" * 72,
+        f"{'Metric':<8} {'Region':<17} {'Mean':>9} {'± Std':>9} {'Median':>9}   n={len(rows)}",
+        "-" * 72,
     ]
-    for i, cls in enumerate(CLASSES):
-        lines.append(f"{cls:<20} {mean_dice[i].item():>10.4f} {mean_iou[i].item():>10.4f}")
-    lines += [
-        "-" * 52,
-        f"{'Mean':<20} {mean_dice.mean().item():>10.4f} {mean_iou.mean().item():>10.4f}",
-        "=" * 52,
-        "",
-    ]
-    output = "\n".join(lines)
-    print(output)
-    if output_file:
-        os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-        with open(output_file, "w") as f:
-            f.write(output)
-        print(f"Results saved to {output_file}")
+    for metric in METRICS:
+        if f"{metric}_{CLASSES[0]}" not in rows[0]:
+            continue
+        values = torch.tensor([[r[f"{metric}_{c}"] for c in CLASSES] for r in rows])
+        s = summarize(values)
+        for c, region in enumerate(CLASSES):
+            lines.append(f"{metric:<8} {region:<17} {s['mean'][c]:>9.4f} {s['std'][c]:>9.4f} {s['median'][c]:>9.4f}")
+        lines.append(f"{metric:<8} {'mean':<17} {s['mean'].mean():>9.4f}")
+        lines.append("-" * 72)
+    lines[-1] = "=" * 72
+    return "\n".join(lines) + "\n"
+
+
+def save_rows(rows, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate a trained BraTS segmentation model")
+    parser = argparse.ArgumentParser(description="Evaluate a trained BraTS segmentation model per patient")
     parser.add_argument("model", type=str, choices=["unet", "unet3d"], help="Model architecture")
     parser.add_argument("weights", type=str, help="Path to model weights (.pth)")
     parser.add_argument("--config", type=str, default=None, help="Override default config file path")
     parser.add_argument("--data_dir", type=str, default=None, help="Override data directory from config")
-    parser.add_argument("--batch_size", type=int, default=None, help="Override batch size from config")
-    parser.add_argument("--output", type=str, default=None, help="Path to save results (optional)")
+    parser.add_argument("--split", type=str, default="test", choices=["test", "val", "train"],
+                        help="Patient split to evaluate (default: held-out test set)")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Sigmoid threshold for binarisation")
+    parser.add_argument("--slice_batch", type=int, default=None, help="Slices per forward pass for the 2D model")
+    parser.add_argument("--no_hd95", action="store_true", help="Skip HD95 (faster)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Save summary to this file and per-patient metrics to <output>.csv")
     args = parser.parse_args()
 
     if args.config:
@@ -97,13 +94,16 @@ def main():
     else:
         config = load_config(args.model)
 
-    training_cfg = config.get("training", {})
-    data_dir   = args.data_dir   or training_cfg.get("data_dir")
-    batch_size = args.batch_size or training_cfg.get("batch_size", 2)
-    num_workers = training_cfg.get("num_workers", 0)
-
-    if not data_dir:
-        raise ValueError("data_dir must be set in config or via --data_dir")
+    if args.data_dir:
+        config.setdefault("data", {})["data_dir"] = args.data_dir
+    if not config.get("data", {}).get("data_dir"):
+        raise ValueError("data.data_dir must be set in config or via --data_dir")
+    split_file = config["data"].get("split_file")
+    if not split_file or not os.path.exists(split_file):
+        raise FileNotFoundError(
+            f"Split file {split_file!r} not found. It is created by training; evaluating without it "
+            "would mix training patients into the evaluation."
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -112,13 +112,25 @@ def main():
     model.load_state_dict(torch.load(args.weights, map_location=device))
     print(f"Loaded weights from {args.weights}")
 
-    dataset_cls = BraTSDataset3D if args.model == "unet3d" else BraTSDataset
-    dataset = dataset_cls(data_dir)
-    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    print(f"Evaluating on {len(dataset)} samples")
+    patient_ids = get_split(config)[args.split]
+    dataset = volume_dataset(config, args.model, patient_ids)
+    num_workers = config.get("training", {}).get("num_workers", 0)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=num_workers)
+    print(f"Evaluating on {len(dataset)} patients ({args.split} split), threshold={args.threshold}")
 
-    mean_dice, mean_iou = evaluate(model, loader, device)
-    print_results(mean_dice, mean_iou, output_file=args.output)
+    slice_batch = args.slice_batch or config.get("training", {}).get("batch_size", 16)
+    rows = evaluate(model, loader, device, threshold=args.threshold, with_hd95=not args.no_hd95,
+                    slice_batch=slice_batch, case_ids=dataset.patient_ids)
+
+    output = summary_table(rows)
+    print(output)
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w") as f:
+            f.write(output)
+        csv_path = os.path.splitext(args.output)[0] + ".csv"
+        save_rows(rows, csv_path)
+        print(f"Summary saved to {args.output}, per-patient metrics to {csv_path}")
 
 
 if __name__ == "__main__":

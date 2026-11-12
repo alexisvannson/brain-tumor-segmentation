@@ -47,7 +47,7 @@ TINY_3D_CFG = {
     }
 }
 
-# Input: (B, 1, 32, 32) → output (B, 1, 20, 20)  — masks same size as input
+# Padded UNet: input (B, 1, 32, 32) → output (B, 1, 32, 32)
 IMG_SIZE_2D = 32
 IMG_SIZE_3D = 32
 
@@ -235,15 +235,26 @@ class TestValidate:
         model     = _tiny_model_2d()
         loader    = _make_loader_2d()
         criterion = nn.BCEWithLogitsLoss()
-        loss = validate(model, loader, criterion, torch.device("cpu"))
-        assert isinstance(loss, float)
+        out = validate(model, loader, criterion, torch.device("cpu"))
+        assert isinstance(out["loss"], float)
+        assert isinstance(out["mean_dice"], float)
+        assert out["dice"].shape == (1,)
 
     def test_positive_loss(self):
         model     = _tiny_model_2d()
         loader    = _make_loader_2d()
         criterion = nn.BCEWithLogitsLoss()
-        loss = validate(model, loader, criterion, torch.device("cpu"))
-        assert loss > 0.0
+        out = validate(model, loader, criterion, torch.device("cpu"))
+        assert out["loss"] > 0.0
+        assert 0.0 <= out["mean_dice"] <= 1.0
+
+    def test_2d_model_on_volumes(self):
+        """2D model + volume loader: predicted slice-wise, Dice per patient volume."""
+        model  = _tiny_model_2d()
+        loader = _make_loader_3d(n=2)
+        out = validate(model, loader, nn.BCEWithLogitsLoss(), torch.device("cpu"), slice_batch=5)
+        assert out["loss"] > 0.0
+        assert 0.0 <= out["mean_dice"] <= 1.0
 
     def test_model_in_eval_mode_after(self):
         model     = _tiny_model_2d()
@@ -265,9 +276,9 @@ class TestValidate:
         model     = _tiny_model_3d()
         loader    = _make_loader_3d()
         criterion = nn.BCEWithLogitsLoss()
-        loss = validate(model, loader, criterion, torch.device("cpu"))
-        assert isinstance(loss, float)
-        assert loss > 0.0
+        out = validate(model, loader, criterion, torch.device("cpu"))
+        assert isinstance(out["loss"], float)
+        assert out["loss"] > 0.0
 
     def test_deterministic_across_calls(self):
         """validate should return the same value on repeated calls (no dropout / bn)."""
@@ -276,7 +287,8 @@ class TestValidate:
         criterion = nn.BCEWithLogitsLoss()
         loss1 = validate(model, loader, criterion, torch.device("cpu"))
         loss2 = validate(model, loader, criterion, torch.device("cpu"))
-        assert abs(loss1 - loss2) < 1e-6
+        assert abs(loss1["loss"] - loss2["loss"]) < 1e-6
+        assert loss1["mean_dice"] == loss2["mean_dice"]
 
 
 # ---------------------------------------------------------------------------
@@ -490,3 +502,82 @@ class TestTrainLoop:
         assert losses, "No train_loss found in log"
         for v in losses:
             assert float(v) < 1e6, f"Suspiciously large loss: {v}"
+
+
+# ---------------------------------------------------------------------------
+# predict / history / patient-level dataloaders
+# ---------------------------------------------------------------------------
+
+from scripts.training import predict, setup_dataloaders
+
+
+class TestPredict:
+    def test_2d_model_slicewise_matches_direct(self):
+        model = _tiny_model_2d().eval()
+        vol = torch.randn(1, 1, 6, 32, 32)
+        with torch.no_grad():
+            out = predict(model, vol, slice_batch=4)
+            direct = torch.stack([model(vol[:, :, d]) for d in range(6)], dim=2)
+        assert out.shape == (1, 1, 6, 32, 32)
+        assert torch.allclose(out, direct, atol=1e-6)
+
+    def test_3d_model_direct(self):
+        model = _tiny_model_3d().eval()
+        vol = torch.randn(1, 1, 16, 16, 16)
+        with torch.no_grad():
+            assert predict(model, vol).shape == (1, 1, 16, 16, 16)
+
+
+class TestHistoryAndSelection:
+    def test_history_csv_written(self, tmp_path):
+        model = _tiny_model_2d()
+        train(
+            model=model, train_loader=_make_loader_2d(), criterion=nn.BCEWithLogitsLoss(),
+            optimizer=optim.Adam(model.parameters(), lr=1e-3), device=torch.device("cpu"),
+            epochs=2, val_loader=_make_loader_2d(n=4), output_path=str(tmp_path),
+            weights_name="h", use_wandb=False,
+        )
+        import csv
+        rows = list(csv.DictReader(open(tmp_path / "history.csv")))
+        assert [r["epoch"] for r in rows] == ["1", "2"]
+        assert all(r["val_mean_dice"] != "" for r in rows)
+
+    def test_log_reports_best_model(self, tmp_path):
+        model = _tiny_model_2d()
+        train(
+            model=model, train_loader=_make_loader_2d(), criterion=nn.BCEWithLogitsLoss(),
+            optimizer=optim.Adam(model.parameters(), lr=1e-3), device=torch.device("cpu"),
+            epochs=1, val_loader=_make_loader_2d(n=4), output_path=str(tmp_path),
+            weights_name="b", use_wandb=False,
+        )
+        log = list(tmp_path.glob("training_logs_*.txt"))[0].read_text()
+        assert "Best model: epoch 1, val_mean_dice=" in log
+
+
+class TestPatientLevelDataloaders:
+    def _make_slices(self, root, n_patients=10, n_slices=3):
+        import h5py
+        import numpy as np
+        for p in range(n_patients):
+            for s in range(n_slices):
+                with h5py.File(root / f"volume_{p}_slice_{s}.h5", "w") as f:
+                    f.create_dataset("image", data=np.random.rand(16, 16, 4).astype(np.float32))
+                    f.create_dataset("mask", data=np.zeros((16, 16, 3), dtype=np.float32))
+
+    def test_no_patient_leakage(self, tmp_path):
+        self._make_slices(tmp_path)
+        cfg = {
+            "data": {"data_dir": str(tmp_path), "split_file": str(tmp_path / "split.json"),
+                     "val_split": 0.2, "test_split": 0.2},
+            "training": {"batch_size": 2},
+        }
+        train_loader, val_loader = setup_dataloaders(cfg, "unet")
+        import json
+        split = json.load(open(tmp_path / "split.json"))
+        train_files = train_loader.dataset.files
+        assert all(any(f"volume_{p}_" in f for p in split["train"]) for f in train_files)
+        assert len(train_files) == len(split["train"]) * 3
+        assert val_loader.dataset.patient_ids == split["val"]
+        assert val_loader.batch_size == 1
+        img, mask = val_loader.dataset[0]
+        assert img.shape == (4, 3, 16, 16)  # whole patient volume
