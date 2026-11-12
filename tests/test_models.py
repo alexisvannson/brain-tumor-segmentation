@@ -14,18 +14,21 @@ TINY_DOWN  = [(1, 8), (8, 16)]   # 2 encoder blocks; last = bottleneck
 TINY_UP    = [(16, 8)]
 TINY_FINAL = (8, 1)
 
-# Input / expected output sizes for the no-padding UNet
+# Default (padding=1) UNet: output has the same spatial size as the input
+INPUT_2D   = (1, 1, 32, 32)   # (B, C, H, W)
+OUTPUT_2D  = (1, 1, 32, 32)
+INPUT_3D   = (1, 1, 32, 32, 32)
+OUTPUT_3D  = (1, 1, 32, 32, 32)
+
+# Input / expected output sizes for the no-padding UNet (padding=0)
 # Each 3x3 conv removes 2px per spatial dim → 2 convs = -4px per block
 # DownBlock1 (in=32): 32-4=28 → pool → 14
 # DownBlock2 (bottleneck, in=14): 14-4=10
 # UpTranspose (in=10): 20
 # Skip crop: 28→20  Cat→UpBlock (padded) → 20
 # FinalBlock (padded + 1x1): 20
-INPUT_2D   = (1, 1, 32, 32)   # (B, C, H, W)
-OUTPUT_2D  = (1, 1, 20, 20)
-
-INPUT_3D   = (1, 1, 32, 32, 32)
-OUTPUT_3D  = (1, 1, 20, 20, 20)
+OUTPUT_2D_VALID = (1, 1, 20, 20)
+OUTPUT_3D_VALID = (1, 1, 20, 20, 20)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +38,11 @@ OUTPUT_3D  = (1, 1, 20, 20, 20)
 class TestDownBlock:
     def test_output_shape(self):
         block = DownBlock(3, 16)
+        x = torch.randn(2, 3, 28, 28)
+        assert block(x).shape == (2, 16, 28, 28)  # padding=1 preserves size
+
+    def test_output_shape_no_padding(self):
+        block = DownBlock(3, 16, padding=0)
         x = torch.randn(2, 3, 28, 28)
         out = block(x)
         # two 3x3 no-padding convs: 28 - 4 = 24
@@ -109,8 +117,19 @@ class TestUnet2D:
             assert p.grad is not None, f"No gradient for {name}"
             assert not p.grad.isnan().any(), f"NaN gradient for {name}"
 
+    def test_valid_conv_output_shape(self):
+        model = Unet(TINY_DOWN, TINY_UP, TINY_FINAL, padding=0)
+        assert model(torch.randn(*INPUT_2D)).shape == torch.Size(OUTPUT_2D_VALID)
+
+    @pytest.mark.parametrize("size", [(240, 240), (33, 47), (17, 64)])
+    def test_output_matches_input_size(self, size):
+        """Padded UNet must predict every input pixel, even for sizes not divisible by 2**depth."""
+        model = Unet([(4, 8), (8, 16), (16, 32)], [(32, 16), (16, 8)], (8, 3))
+        out = model(torch.randn(1, 4, *size))
+        assert out.shape == (1, 3, *size)
+
     def test_encoder_reduces_spatial_size(self, model):
-        """No-padding encoder blocks must shrink spatial dims."""
+        """Pooling between encoder blocks must shrink spatial dims."""
         x = torch.randn(*INPUT_2D)
         hooks, sizes = [], []
 
@@ -168,6 +187,11 @@ class TestDownBlock3d:
     def test_output_shape(self):
         block = DownBlock3d(2, 8)
         x = torch.randn(1, 2, 16, 16, 16)
+        assert block(x).shape == (1, 8, 16, 16, 16)
+
+    def test_output_shape_no_padding(self):
+        block = DownBlock3d(2, 8, padding=0)
+        x = torch.randn(1, 2, 16, 16, 16)
         out = block(x)
         assert out.shape == (1, 8, 12, 12, 12)  # 16 - 4
 
@@ -206,6 +230,15 @@ class TestUnet3D:
     def test_output_channels(self, model):
         x = torch.randn(*INPUT_3D)
         assert model(x).shape[1] == TINY_FINAL[1]
+
+    def test_valid_conv_output_shape(self):
+        model = Unet3d(TINY_DOWN, TINY_UP, TINY_FINAL, padding=0)
+        assert model(torch.randn(*INPUT_3D)).shape == torch.Size(OUTPUT_3D_VALID)
+
+    def test_output_matches_odd_input_size(self, model):
+        """155 slices (BraTS depth) is not divisible by 2; output must still match."""
+        out = model(torch.randn(1, 1, 15, 18, 21))
+        assert out.shape == (1, 1, 15, 18, 21)
 
     def test_batch_size_preserved(self, model):
         x = torch.randn(2, 1, 32, 32, 32)

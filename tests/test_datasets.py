@@ -91,11 +91,26 @@ class TestBraTSDataset:
         assert masks.shape == (2, 3, 32, 32)
 
     def test_values_in_valid_range(self, data_dir):
-        """Image values should be >= 0 (written from np.random.rand)."""
-        ds = BraTSDataset(data_dir)
+        """Without normalisation, raw values come through unchanged (np.random.rand >= 0)."""
+        ds = BraTSDataset(data_dir, normalize=None)
         img, mask = ds[0]
         assert img.min() >= 0.0
-        assert mask.min() >= 0.0
+        assert set(mask.unique().tolist()) <= {0.0, 1.0}
+
+    def test_slice_normalisation(self, data_dir):
+        ds = BraTSDataset(data_dir, normalize="slice")
+        img, _ = ds[0]
+        flat = img.reshape(4, -1)
+        assert torch.allclose(flat.mean(dim=1), torch.zeros(4), atol=1e-4)
+        assert torch.allclose(flat.std(dim=1, unbiased=False), torch.ones(4), atol=1e-3)
+
+    def test_patient_filter(self, tmp_path):
+        for pid in (1, 2, 3):
+            for s in range(3):
+                _write_2d_h5(tmp_path / f"volume_{pid}_slice_{s}.h5")
+        ds = BraTSDataset(str(tmp_path), patient_ids=["1", "3"])
+        assert len(ds) == 6
+        assert not any("volume_2_" in f for f in ds.files)
 
     def test_different_spatial_sizes(self, tmp_path):
         """Dataset should handle H5 files with different image sizes."""
@@ -169,6 +184,20 @@ class TestBraTSDataset3D:
         assert imgs.shape[0] == 2
         assert imgs.shape[1] == 4   # channels
         assert imgs.dim() == 5      # (B, C, D, H, W)
+
+    def test_stacks_slice_files_per_patient(self, tmp_path):
+        """Kaggle layout: one file per slice -> one item per patient, slices in index order."""
+        for pid in (7, 8):
+            for s in (0, 1, 2, 10):  # 10 must come after 2 (numeric, not lexicographic)
+                with h5py.File(tmp_path / f"volume_{pid}_slice_{s}.h5", "w") as f:
+                    f.create_dataset("image", data=np.full((8, 8, 4), s + 1, dtype=np.float32))
+                    f.create_dataset("mask", data=np.zeros((8, 8, 3), dtype=np.float32))
+        ds = BraTSDataset3D(str(tmp_path), normalize=None)
+        assert len(ds) == 2
+        assert ds.patient_ids == ["7", "8"]
+        img, mask = ds[0]
+        assert img.shape == (4, 4, 8, 8) and mask.shape == (3, 4, 8, 8)
+        assert img[0, :, 0, 0].tolist() == [1, 2, 3, 11]
 
     def test_spatial_dims_correct(self, data_dir):
         """Spatial dims should be (D, H, W) = (16, 16, 16) for our fixture."""

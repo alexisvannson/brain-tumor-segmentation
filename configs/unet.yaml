@@ -10,13 +10,22 @@ model:
     - [512, 256]
     - [256, 128]
     - [128, 64]
+  padding: 1          # 1 = same-size output (full image); 0 = original valid-conv U-Net
   final_block: [64, 3]
 
-training:
+data:
   data_dir: brats2020/BraTS2020_training_data/content/data
+  split_file: splits/brats2020_seed42.json   # patient-level split, created on first run
+  split_seed: 42
+  val_split: 0.15      # fraction of patients
+  test_split: 0.15     # fraction of patients, never used for training or model selection
+  normalize: slice     # z-score on brain voxels: slice | volume | null
+  mask_format: labels  # labels = NCR/ED/ET one-hot (converted to WT/TC/ET); regions = already WT/TC/ET
+
+training:
+  seed: 42
   checkpoint_dir: checkpoints
   epochs: 50
   batch_size: 8
   lr: 1.0e-4
-  val_split: 0.2
   num_workers: 4

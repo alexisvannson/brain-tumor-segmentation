@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class DownBlock3d(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, padding: int = 1):
         super().__init__()
-        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3)
-        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3)
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=padding)
+        self.conv2 = nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=padding)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -43,13 +44,17 @@ class FinalBlock3d(nn.Module):
 
 
 class Unet3d(nn.Module):
-    def __init__(self, down_layers, up_layers, final_block):
+    """3D U-Net. See `models.Unet.Unet` for the meaning of ``padding``."""
+    spatial_dims = 3
+
+    def __init__(self, down_layers, up_layers, final_block, padding: int = 1):
         super().__init__()
+        self.padding = padding
         self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
 
         # Encoder — last block is the bottleneck (no pool after it)
         self.down_blocks = nn.ModuleList([
-            DownBlock3d(*layer) for layer in down_layers
+            DownBlock3d(*layer, padding=padding) for layer in down_layers
         ])
 
         # Decoder — upsample then merge skip connection
@@ -73,6 +78,12 @@ class Unet3d(nn.Module):
         return skip[:, :, d0:d0+td, h0:h0+th, w0:w0+tw]
 
     def forward(self, x):
+        size = x.shape[2:]
+        if self.padding:
+            m = 2 ** (len(self.down_blocks) - 1)
+            pd, ph, pw = ((-s) % m for s in size)
+            x = F.pad(x, (0, pw, 0, ph, 0, pd))
+
         # Encoder: save skip connections before pooling
         skips = []
         for block in self.down_blocks[:-1]:
@@ -90,7 +101,10 @@ class Unet3d(nn.Module):
             x = torch.cat((x, skip), dim=1)
             x = up_b(x)
 
-        return self.final(x)
+        x = self.final(x)
+        if self.padding:
+            x = x[:, :, :size[0], :size[1], :size[2]]
+        return x
 
 
 if __name__ == "__main__":
